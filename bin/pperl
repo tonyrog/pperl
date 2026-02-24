@@ -1,0 +1,295 @@
+#!/usr/bin/env escript
+%%! -pa ebin
+
+%%%-------------------------------------------------------------------
+%%% pperl - P2P encrypted file transfer
+%%%-------------------------------------------------------------------
+
+main(Args) ->
+    %% Ensure apps are started
+    application:ensure_all_started(crypto),
+    application:ensure_all_started(ssl),
+
+    case Args of
+        ["init" | Rest] ->
+            cmd_init(Rest);
+        ["whoami"] ->
+            cmd_whoami();
+        ["export" | Rest] ->
+            cmd_export(Rest);
+        ["trust", Name, CertFile] ->
+            cmd_trust(Name, CertFile);
+        ["peers"] ->
+            cmd_peers();
+        ["untrust", Name] ->
+            cmd_untrust(Name);
+        ["send", File] ->
+            cmd_send(File);
+        ["recv" | Rest] ->
+            cmd_recv(Rest);
+        ["pending"] ->
+            cmd_pending();
+        ["help"] ->
+            cmd_help();
+        [] ->
+            cmd_help();
+        _ ->
+            io:format("Unknown command. Use 'pperl help' for usage.~n"),
+            halt(1)
+    end.
+
+%%===================================================================
+%% Commands
+%%===================================================================
+
+cmd_help() ->
+    io:format("pperl - P2P encrypted file transfer~n~n"),
+    io:format("Identity:~n"),
+    io:format("  pperl init [name]         Generate identity~n"),
+    io:format("  pperl whoami              Show your fingerprint~n"),
+    io:format("  pperl export [file]       Export certificate~n"),
+    io:format("~n"),
+    io:format("Trust:~n"),
+    io:format("  pperl trust <name> <cert> Import peer certificate~n"),
+    io:format("  pperl peers               List trusted peers~n"),
+    io:format("  pperl untrust <name>      Remove trusted peer~n"),
+    io:format("~n"),
+    io:format("Transfer:~n"),
+    io:format("  pperl send <file>         Send a file~n"),
+    io:format("  pperl recv [dir]          Receive a file~n"),
+    io:format("  pperl pending             List incomplete transfers~n"),
+    io:format("~n"),
+    io:format("Workflow:~n"),
+    io:format("  1. Both peers run 'pperl init' and exchange certificates~n"),
+    io:format("  2. Both run 'pperl trust <name> <cert>' to trust each other~n"),
+    io:format("  3. Sender runs 'pperl send <file>', gets connection string~n"),
+    io:format("  4. Receiver runs 'pperl recv', gets connection string~n"),
+    io:format("  5. Exchange connection strings and follow prompts~n").
+
+cmd_init(Args) ->
+    Name = case Args of
+        [N] -> N;
+        [] ->
+            {ok, Host} = inet:gethostname(),
+            "pperl@" ++ Host
+    end,
+    case pperl_identity:has_identity() of
+        true ->
+            io:format("Identity already exists.~n"),
+            {ok, FP} = pperl_identity:get_fingerprint(),
+            io:format("Fingerprint: ~s~n", [FP]);
+        false ->
+            io:format("Generating identity '~s'...~n", [Name]),
+            case pperl_identity:generate_identity(Name) of
+                {ok, FP} ->
+                    io:format("Done!~n~n"),
+                    io:format("Your fingerprint:~n~s~n~n", [FP]),
+                    io:format("Share your certificate with peers:~n"),
+                    {ok, #{cert := CertPath}} = pperl_identity:get_identity(),
+                    io:format("  ~s~n", [CertPath]);
+                {error, Reason} ->
+                    io:format("Error: ~p~n", [Reason]),
+                    halt(1)
+            end
+    end.
+
+cmd_whoami() ->
+    case pperl_identity:has_identity() of
+        true ->
+            {ok, FP} = pperl_identity:get_fingerprint(),
+            {ok, #{cert := CertPath}} = pperl_identity:get_identity(),
+            io:format("Fingerprint:~n~s~n~n", [FP]),
+            io:format("Certificate: ~s~n", [CertPath]);
+        false ->
+            io:format("No identity. Run 'pperl init' first.~n"),
+            halt(1)
+    end.
+
+cmd_export(Args) ->
+    case pperl_identity:has_identity() of
+        true ->
+            {ok, #{cert := CertPath}} = pperl_identity:get_identity(),
+            DestFile = case Args of
+                [F] -> F;
+                [] -> "my_cert.pem"
+            end,
+            case file:copy(CertPath, DestFile) of
+                {ok, _} ->
+                    io:format("Certificate exported to: ~s~n", [DestFile]),
+                    io:format("Share this file with peers who want to trust you.~n");
+                {error, Reason} ->
+                    io:format("Error: ~p~n", [Reason]),
+                    halt(1)
+            end;
+        false ->
+            io:format("No identity. Run 'pperl init' first.~n"),
+            halt(1)
+    end.
+
+cmd_trust(Name, CertFile) ->
+    case pperl_identity:import_peer(Name, CertFile) of
+        ok ->
+            {ok, FP} = pperl_identity:get_peer_fingerprint(Name),
+            io:format("Trusted '~s'~n", [Name]),
+            io:format("Fingerprint: ~s~n", [FP]);
+        {error, {not_found, _}} ->
+            io:format("Certificate file not found: ~s~n", [CertFile]),
+            halt(1);
+        {error, Reason} ->
+            io:format("Error: ~p~n", [Reason]),
+            halt(1)
+    end.
+
+cmd_peers() ->
+    case pperl_identity:list_peers() of
+        [] ->
+            io:format("No trusted peers.~n"),
+            io:format("Use 'pperl trust <name> <cert>' to add peers.~n");
+        Peers ->
+            io:format("Trusted peers:~n"),
+            lists:foreach(fun(Name) ->
+                {ok, FP} = pperl_identity:get_peer_fingerprint(Name),
+                ShortFP = binary:part(FP, 0, 23),
+                io:format("  ~-15s ~s...~n", [Name, ShortFP])
+            end, Peers)
+    end.
+
+cmd_untrust(Name) ->
+    case pperl_identity:remove_peer(Name) of
+        ok ->
+            io:format("Removed '~s' from trusted peers.~n", [Name]);
+        {error, {not_found, _}} ->
+            io:format("Peer '~s' not found.~n", [Name]),
+            halt(1)
+    end.
+
+cmd_send(FilePath) ->
+    check_identity(),
+
+    case filelib:is_regular(FilePath) of
+        false ->
+            io:format("File not found: ~s~n", [FilePath]),
+            halt(1);
+        true -> ok
+    end,
+
+    Size = filelib:file_size(FilePath),
+    io:format("File: ~s (~s)~n~n", [FilePath, format_size(Size)]),
+
+    io:format("Discovering public address...~n"),
+    case pperl_p2p:init_send() of
+        {ok, ConnStr} ->
+            io:format("~n"),
+            io:format("========================================~n"),
+            io:format("YOUR CONNECTION STRING:~n"),
+            io:format("~s~n", [ConnStr]),
+            io:format("========================================~n"),
+            io:format("~n"),
+            io:format("Share this with the receiver, then enter their string.~n~n"),
+
+            PeerStr = read_line("Peer's connection string: "),
+            io:format("~n"),
+
+            case pperl_p2p:do_send(FilePath, string:trim(PeerStr)) of
+                ok ->
+                    io:format("~nTransfer complete!~n");
+                {error, Reason} ->
+                    io:format("~nTransfer failed: ~p~n", [Reason]),
+                    halt(1)
+            end;
+        {error, Reason} ->
+            io:format("Discovery failed: ~p~n", [Reason]),
+            halt(1)
+    end.
+
+cmd_recv(Args) ->
+    check_identity(),
+
+    DestDir = case Args of
+        [D] -> D;
+        [] -> "."
+    end,
+
+    case filelib:is_dir(DestDir) of
+        false ->
+            io:format("Directory not found: ~s~n", [DestDir]),
+            halt(1);
+        true -> ok
+    end,
+
+    io:format("Destination: ~s~n~n", [DestDir]),
+    io:format("Discovering public address...~n"),
+
+    case pperl_p2p:init_receive() of
+        {ok, ConnStr, _Port} ->
+            io:format("~n"),
+            io:format("========================================~n"),
+            io:format("YOUR CONNECTION STRING:~n"),
+            io:format("~s~n", [ConnStr]),
+            io:format("========================================~n"),
+            io:format("~n"),
+            io:format("Share this with the sender, then enter their string.~n~n"),
+
+            PeerStr = read_line("Peer's connection string: "),
+            io:format("~n"),
+
+            case pperl_p2p:do_receive(DestDir, string:trim(PeerStr)) of
+                {ok, Path} ->
+                    io:format("~nReceived: ~s~n", [Path]);
+                {error, Reason} ->
+                    io:format("~nTransfer failed: ~p~n", [Reason]),
+                    halt(1)
+            end;
+        {error, Reason} ->
+            io:format("Discovery failed: ~p~n", [Reason]),
+            halt(1)
+    end.
+
+cmd_pending() ->
+    case pperl_transfer:list_pending() of
+        [] ->
+            io:format("No pending transfers.~n");
+        Pending ->
+            io:format("Pending transfers:~n"),
+            lists:foreach(fun(#{filename := Name, size := Size, received := Recv}) ->
+                Pct = (Recv * 100) div Size,
+                io:format("  ~s: ~s / ~s (~p%%)~n",
+                          [Name, format_size(Recv), format_size(Size), Pct])
+            end, Pending)
+    end.
+
+%%===================================================================
+%% Helpers
+%%===================================================================
+
+check_identity() ->
+    case pperl_identity:has_identity() of
+        false ->
+            io:format("No identity. Run 'pperl init' first.~n"),
+            halt(1);
+        true ->
+            ok
+    end,
+    case pperl_identity:list_peers() of
+        [] ->
+            io:format("Warning: No trusted peers. Connection will fail.~n"),
+            io:format("Use 'pperl trust <name> <cert>' to add peers.~n~n");
+        _ ->
+            ok
+    end.
+
+format_size(Bytes) when Bytes < 1024 ->
+    io_lib:format("~p B", [Bytes]);
+format_size(Bytes) when Bytes < 1024 * 1024 ->
+    io_lib:format("~.1f KB", [Bytes / 1024]);
+format_size(Bytes) when Bytes < 1024 * 1024 * 1024 ->
+    io_lib:format("~.1f MB", [Bytes / (1024 * 1024)]);
+format_size(Bytes) ->
+    io_lib:format("~.1f GB", [Bytes / (1024 * 1024 * 1024)]).
+
+read_line(Prompt) ->
+    io:format("~s", [Prompt]),
+    case io:get_line("") of
+        eof -> "";
+        Line -> Line
+    end.

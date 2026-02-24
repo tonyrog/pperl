@@ -1,0 +1,28 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+%%! -pa ebin
+
+main([]) ->
+    io:format("Querying STUN servers for your public address...~n"),
+    case stun_client:get_mapped_address() of
+        {ok, {{A,B,C,D}, Port}} ->
+            io:format("Public IP:   ~B.~B.~B.~B~n", [A,B,C,D]),
+            io:format("Public Port: ~B~n", [Port]);
+        {error, Reason} ->
+            io:format("Error: ~p~n", [Reason]),
+            halt(1)
+    end;
+main([Host, PortStr]) ->
+    Port = list_to_integer(PortStr),
+    io:format("Querying ~s:~B...~n", [Host, Port]),
+    case stun_client:query(Host, Port) of
+        {ok, {{A,B,C,D}, P}} ->
+            io:format("Public IP:   ~B.~B.~B.~B~n", [A,B,C,D]),
+            io:format("Public Port: ~B~n", [P]);
+        {error, Reason} ->
+            io:format("Error: ~p~n", [Reason]),
+            halt(1)
+    end;
+main(_) ->
+    io:format("Usage: stun [host port]~n"),
+    halt(1).

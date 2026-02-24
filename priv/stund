@@ -1,0 +1,20 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+%%! -pa ebin
+
+main([]) ->
+    main(["3478"]);
+main([PortStr]) ->
+    Port = list_to_integer(PortStr),
+    {ok, _Pid} = stun_server:start(Port),
+    io:format("Press Ctrl+C to stop~n"),
+    wait_forever();
+main(_) ->
+    io:format("Usage: stund [port]~n"),
+    io:format("  Default port: 3478~n"),
+    halt(1).
+
+wait_forever() ->
+    receive
+        _ -> wait_forever()
+    end.

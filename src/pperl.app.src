@@ -1,0 +1,9 @@
+{application, pperl,
+ [{description, "pperl"},
+  {vsn, git},
+  {modules, ["@@MODULES@@"]},
+%%  {mod, {pperl_app, []}},
+%%  {registered, [pperl_srv]},
+  {env, []},
+  {applications,[kernel,stdlib,crypto,ssl,public_key]}
+  ]}.
