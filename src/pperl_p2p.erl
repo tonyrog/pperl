@@ -26,6 +26,10 @@
     send_file_to/3,
     receive_file_from/2,
 
+    %% Direct mode (local/public)
+    send_direct/3,     %% Send file directly to IP:Port
+    recv_direct/2,     %% Receive file on port
+
     %% Interactive helpers
     init_send/0,       %% Sender: get connection string to share
     init_receive/0,    %% Receiver: get connection string to share
@@ -161,6 +165,51 @@ receive_file_from(LocalPort, DestDir) ->
             Result = pperl_transfer:recv_file(Socket, DestDir),
             ssl:close(Socket),
             Result;
+        {error, _} = Err ->
+            Err
+    end.
+
+%%===================================================================
+%% Direct Mode (local/public networks)
+%%===================================================================
+
+%% @doc Send a file directly to a peer (no STUN/hole punching).
+%% Use for local network or public IP peers.
+-spec send_direct(string(), string(), inet:port_number()) ->
+    ok | {error, term()}.
+send_direct(FilePath, Host, Port) ->
+    io:format("Connecting to ~s:~p...~n", [Host, Port]),
+    case pperl_dtls:connect(Host, Port) of
+        {ok, Socket} ->
+            io:format("Connected, sending file...~n"),
+            Result = pperl_transfer:send_file(Socket, FilePath,
+                                               filename:basename(FilePath)),
+            pperl_dtls:close(Socket),
+            Result;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Receive a file directly (listen on port).
+%% Use for local network or public IP peers.
+-spec recv_direct(string(), inet:port_number()) ->
+    {ok, string()} | {error, term()}.
+recv_direct(DestDir, Port) ->
+    io:format("Listening on port ~p...~n", [Port]),
+    case pperl_dtls:listen(Port) of
+        {ok, ListenSocket} ->
+            io:format("Waiting for connection...~n"),
+            case pperl_dtls:accept(ListenSocket) of
+                {ok, Socket} ->
+                    io:format("Connected, receiving file...~n"),
+                    Result = pperl_transfer:recv_file(Socket, DestDir),
+                    pperl_dtls:close(Socket),
+                    pperl_dtls:close(ListenSocket),
+                    Result;
+                {error, _} = Err ->
+                    pperl_dtls:close(ListenSocket),
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.

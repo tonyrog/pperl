@@ -18,15 +18,29 @@ main(Args) ->
         ["export" | Rest] ->
             cmd_export(Rest);
         ["trust", Name, CertFile] ->
-            cmd_trust(Name, CertFile);
+            cmd_trust(Name, CertFile, undefined);
+        ["trust", Name, CertFile, ConnStr] ->
+            cmd_trust(Name, CertFile, ConnStr);
+        ["address", Name, ConnStr] ->
+            cmd_address(Name, ConnStr);
         ["peers"] ->
             cmd_peers();
         ["untrust", Name] ->
             cmd_untrust(Name);
         ["send", File] ->
-            cmd_send(File);
-        ["recv" | Rest] ->
-            cmd_recv(Rest);
+            cmd_send(File, undefined);
+        ["send", File, Peer] ->
+            cmd_send(File, Peer);
+        ["recv"] ->
+            cmd_recv(".", undefined);
+        ["recv", DirOrPeer] ->
+            %% Could be dir or peer name - check if it's a peer
+            case pperl_identity:get_peer_address(DirOrPeer) of
+                {ok, _} -> cmd_recv(".", DirOrPeer);
+                {error, _} -> cmd_recv(DirOrPeer, undefined)
+            end;
+        ["recv", Peer, Dir] ->
+            cmd_recv(Dir, Peer);
         ["pending"] ->
             cmd_pending();
         ["help"] ->
@@ -50,13 +64,18 @@ cmd_help() ->
     io:format("  pperl export [file]       Export certificate~n"),
     io:format("~n"),
     io:format("Trust:~n"),
-    io:format("  pperl trust <name> <cert> Import peer certificate~n"),
+    io:format("  pperl trust <name> <cert> [MODE:IP:PORT]~n"),
+    io:format("                            Import peer certificate~n"),
+    io:format("  pperl address <name> MODE:IP:PORT~n"),
+    io:format("                            Set peer connection address~n"),
     io:format("  pperl peers               List trusted peers~n"),
     io:format("  pperl untrust <name>      Remove trusted peer~n"),
     io:format("~n"),
+    io:format("  MODE: L=local, P=public, S=stun~n"),
+    io:format("~n"),
     io:format("Transfer:~n"),
-    io:format("  pperl send <file>         Send a file~n"),
-    io:format("  pperl recv [dir]          Receive a file~n"),
+    io:format("  pperl send <file> [peer]  Send a file (direct if peer has address)~n"),
+    io:format("  pperl recv [peer] [dir]   Receive a file~n"),
     io:format("  pperl pending             List incomplete transfers~n"),
     io:format("~n"),
     io:format("Workflow:~n"),
@@ -126,14 +145,36 @@ cmd_export(Args) ->
             halt(1)
     end.
 
-cmd_trust(Name, CertFile) ->
-    case pperl_identity:import_peer(Name, CertFile) of
+cmd_trust(Name, CertFile, ConnStr) ->
+    case pperl_identity:import_peer(Name, CertFile, ConnStr) of
         ok ->
             {ok, FP} = pperl_identity:get_peer_fingerprint(Name),
             io:format("Trusted '~s'~n", [Name]),
-            io:format("Fingerprint: ~s~n", [FP]);
+            io:format("Fingerprint: ~s~n", [FP]),
+            case ConnStr of
+                undefined -> ok;
+                _ -> io:format("Address: ~s~n", [ConnStr])
+            end;
         {error, {not_found, _}} ->
             io:format("Certificate file not found: ~s~n", [CertFile]),
+            halt(1);
+        {error, invalid_mode} ->
+            io:format("Invalid mode. Use L (local), P (public), or S (stun).~n"),
+            halt(1);
+        {error, Reason} ->
+            io:format("Error: ~p~n", [Reason]),
+            halt(1)
+    end.
+
+cmd_address(Name, ConnStr) ->
+    case pperl_identity:set_peer_address(Name, ConnStr) of
+        ok ->
+            io:format("Updated address for '~s': ~s~n", [Name, ConnStr]);
+        {error, {peer_not_found, _}} ->
+            io:format("Peer '~s' not found.~n", [Name]),
+            halt(1);
+        {error, invalid_mode} ->
+            io:format("Invalid mode. Use L (local), P (public), or S (stun).~n"),
             halt(1);
         {error, Reason} ->
             io:format("Error: ~p~n", [Reason]),
@@ -150,7 +191,13 @@ cmd_peers() ->
             lists:foreach(fun(Name) ->
                 {ok, FP} = pperl_identity:get_peer_fingerprint(Name),
                 ShortFP = binary:part(FP, 0, 23),
-                io:format("  ~-15s ~s...~n", [Name, ShortFP])
+                AddrStr = case pperl_identity:get_peer_address(Name) of
+                    {ok, Addr} ->
+                        lists:flatten(pperl_identity:format_peer_address(Addr));
+                    {error, not_set} ->
+                        "(no address)"
+                end,
+                io:format("  ~-15s ~-22s ~s...~n", [Name, AddrStr, ShortFP])
             end, Peers)
     end.
 
@@ -163,7 +210,7 @@ cmd_untrust(Name) ->
             halt(1)
     end.
 
-cmd_send(FilePath) ->
+cmd_send(FilePath, PeerName) ->
     check_identity(),
 
     case filelib:is_regular(FilePath) of
@@ -176,6 +223,39 @@ cmd_send(FilePath) ->
     Size = filelib:file_size(FilePath),
     io:format("File: ~s (~s)~n~n", [FilePath, format_size(Size)]),
 
+    case PeerName of
+        undefined ->
+            %% No peer specified - use STUN exchange flow
+            cmd_send_stun(FilePath);
+        _ ->
+            %% Peer specified - try direct connection
+            case pperl_identity:get_peer_address(PeerName) of
+                {ok, #{mode := Mode, address := Addr, port := Port}} when Mode =:= local; Mode =:= public ->
+                    cmd_send_direct(FilePath, PeerName, Addr, Port);
+                {ok, #{mode := stun}} ->
+                    io:format("Peer '~s' uses STUN mode, falling back to exchange flow.~n~n", [PeerName]),
+                    cmd_send_stun(FilePath);
+                {error, not_set} ->
+                    io:format("No address set for '~s'. Use 'pperl address ~s MODE:IP:PORT'~n", [PeerName, PeerName]),
+                    io:format("Or omit peer name to use STUN exchange.~n"),
+                    halt(1);
+                {error, {peer_not_found, _}} ->
+                    io:format("Peer '~s' not found.~n", [PeerName]),
+                    halt(1)
+            end
+    end.
+
+cmd_send_direct(FilePath, PeerName, Addr, Port) ->
+    io:format("Connecting to ~s (~s:~p)...~n", [PeerName, Addr, Port]),
+    case pperl_p2p:send_direct(FilePath, Addr, Port) of
+        ok ->
+            io:format("~nTransfer complete!~n");
+        {error, Reason} ->
+            io:format("~nTransfer failed: ~p~n", [Reason]),
+            halt(1)
+    end.
+
+cmd_send_stun(FilePath) ->
     io:format("Discovering public address...~n"),
     case pperl_p2p:init_send() of
         {ok, ConnStr} ->
@@ -202,13 +282,8 @@ cmd_send(FilePath) ->
             halt(1)
     end.
 
-cmd_recv(Args) ->
+cmd_recv(DestDir, PeerName) ->
     check_identity(),
-
-    DestDir = case Args of
-        [D] -> D;
-        [] -> "."
-    end,
 
     case filelib:is_dir(DestDir) of
         false ->
@@ -218,6 +293,41 @@ cmd_recv(Args) ->
     end,
 
     io:format("Destination: ~s~n~n", [DestDir]),
+
+    case PeerName of
+        undefined ->
+            %% No peer specified - use STUN exchange flow
+            cmd_recv_stun(DestDir);
+        _ ->
+            %% Peer specified - listen for direct connection
+            case pperl_identity:get_peer_address(PeerName) of
+                {ok, #{mode := Mode}} when Mode =:= local; Mode =:= public ->
+                    cmd_recv_direct(DestDir, PeerName);
+                {ok, #{mode := stun}} ->
+                    io:format("Peer '~s' uses STUN mode, falling back to exchange flow.~n~n", [PeerName]),
+                    cmd_recv_stun(DestDir);
+                {error, not_set} ->
+                    io:format("No address set for '~s'. Use 'pperl address ~s MODE:IP:PORT'~n", [PeerName, PeerName]),
+                    io:format("Or omit peer name to use STUN exchange.~n"),
+                    halt(1);
+                {error, {peer_not_found, _}} ->
+                    io:format("Peer '~s' not found.~n", [PeerName]),
+                    halt(1)
+            end
+    end.
+
+cmd_recv_direct(DestDir, PeerName) ->
+    Port = 7700,  %% Default listen port
+    io:format("Waiting for ~s on port ~p...~n", [PeerName, Port]),
+    case pperl_p2p:recv_direct(DestDir, Port) of
+        {ok, Path} ->
+            io:format("~nReceived: ~s~n", [Path]);
+        {error, Reason} ->
+            io:format("~nTransfer failed: ~p~n", [Reason]),
+            halt(1)
+    end.
+
+cmd_recv_stun(DestDir) ->
     io:format("Discovering public address...~n"),
 
     case pperl_p2p:init_receive() of

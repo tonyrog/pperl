@@ -22,10 +22,17 @@
 
     %% Peer trust management
     import_peer/2,
+    import_peer/3,
     remove_peer/1,
     list_peers/0,
     get_peer_cert/1,
     get_peer_fingerprint/1,
+
+    %% Peer connection info
+    set_peer_address/2,
+    get_peer_address/1,
+    get_peer_info/1,
+    format_peer_address/1,
 
     %% For DTLS configuration
     ssl_options/0,
@@ -109,12 +116,23 @@ get_fingerprint() ->
 %% @doc Import a peer's certificate.
 -spec import_peer(Name :: string(), CertPath :: string()) -> ok | {error, term()}.
 import_peer(Name, CertPath) ->
+    import_peer(Name, CertPath, undefined).
+
+%% @doc Import a peer's certificate with optional connection info.
+%% ConnStr format: "MODE:IP:PORT" where MODE is L|P|S
+-spec import_peer(Name :: string(), CertPath :: string(), ConnStr :: string() | undefined) ->
+    ok | {error, term()}.
+import_peer(Name, CertPath, ConnStr) ->
     init(),
     case filelib:is_regular(CertPath) of
         true ->
             DestPath = peer_cert_file(Name),
             case file:copy(CertPath, DestPath) of
-                {ok, _} -> ok;
+                {ok, _} ->
+                    case ConnStr of
+                        undefined -> ok;
+                        _ -> set_peer_address(Name, ConnStr)
+                    end;
                 {error, Reason} -> {error, {copy_failed, Reason}}
             end;
         false ->
@@ -124,10 +142,14 @@ import_peer(Name, CertPath) ->
 %% @doc Remove a trusted peer.
 -spec remove_peer(Name :: string()) -> ok | {error, term()}.
 remove_peer(Name) ->
-    Path = peer_cert_file(Name),
-    case filelib:is_regular(Path) of
-        true -> file:delete(Path);
-        false -> {error, {not_found, Name}}
+    CertPath = peer_cert_file(Name),
+    ConfPath = peer_conf_file(Name),
+    case filelib:is_regular(CertPath) of
+        true ->
+            file:delete(ConfPath),  %% ignore error if no conf
+            file:delete(CertPath);
+        false ->
+            {error, {not_found, Name}}
     end.
 
 %% @doc List all trusted peers.
@@ -156,6 +178,49 @@ get_peer_fingerprint(Name) ->
     case get_peer_cert(Name) of
         {ok, Path} -> cert_fingerprint(Path);
         Error -> Error
+    end.
+
+%% @doc Set connection address for a peer.
+%% ConnStr format: "MODE:IP:PORT" where MODE is L (local), P (public), or S (stun)
+-spec set_peer_address(Name :: string(), ConnStr :: string()) -> ok | {error, term()}.
+set_peer_address(Name, ConnStr) ->
+    case get_peer_cert(Name) of
+        {ok, _} ->
+            case parse_conn_str(ConnStr) of
+                {ok, AddrInfo} ->
+                    ConfPath = peer_conf_file(Name),
+                    Content = io_lib:format("~p.~n", [AddrInfo]),
+                    file:write_file(ConfPath, Content);
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} ->
+            {error, {peer_not_found, Name}}
+    end.
+
+%% @doc Get connection address for a peer.
+-spec get_peer_address(Name :: string()) -> {ok, map()} | {error, term()}.
+get_peer_address(Name) ->
+    ConfPath = peer_conf_file(Name),
+    case file:consult(ConfPath) of
+        {ok, [AddrInfo]} -> {ok, AddrInfo};
+        {error, enoent} -> {error, not_set};
+        {error, Reason} -> {error, Reason}
+    end.
+
+%% @doc Get full peer info (cert, fingerprint, address).
+-spec get_peer_info(Name :: string()) -> {ok, map()} | {error, term()}.
+get_peer_info(Name) ->
+    case get_peer_cert(Name) of
+        {ok, CertPath} ->
+            {ok, FP} = cert_fingerprint(CertPath),
+            Address = case get_peer_address(Name) of
+                {ok, Addr} -> Addr;
+                {error, not_set} -> undefined
+            end,
+            {ok, #{name => Name, cert => CertPath, fingerprint => FP, address => Address}};
+        {error, _} = Err ->
+            Err
     end.
 
 %% @doc Get SSL options for DTLS server.
@@ -225,6 +290,9 @@ key_file() ->
 
 peer_cert_file(Name) ->
     filename:join(trusted_dir(), Name ++ ".pem").
+
+peer_conf_file(Name) ->
+    filename:join(trusted_dir(), Name ++ ".conf").
 
 default_common_name() ->
     {ok, Hostname} = inet:gethostname(),
@@ -320,3 +388,55 @@ check_fingerprint(Cert, TrustedFingerprints) ->
         false ->
             {fail, {untrusted_peer, PeerFP}}
     end.
+
+%% Parse connection string "MODE:IP:PORT" -> #{mode, address, port}
+parse_conn_str(ConnStr) ->
+    case string:split(ConnStr, ":") of
+        [ModeStr, Rest] ->
+            case parse_mode(ModeStr) of
+                {ok, Mode} ->
+                    case parse_ip_port(Rest) of
+                        {ok, IP, Port} ->
+                            {ok, #{mode => Mode, address => IP, port => Port}};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
+        _ ->
+            {error, invalid_format}
+    end.
+
+parse_mode("L") -> {ok, local};
+parse_mode("l") -> {ok, local};
+parse_mode("P") -> {ok, public};
+parse_mode("p") -> {ok, public};
+parse_mode("S") -> {ok, stun};
+parse_mode("s") -> {ok, stun};
+parse_mode(_) -> {error, invalid_mode}.
+
+parse_ip_port(Str) ->
+    %% Handle IPv4 "IP:PORT" or IPv6 "[IP]:PORT"
+    case string:split(Str, ":", trailing) of
+        [IPStr, PortStr] ->
+            try
+                Port = list_to_integer(PortStr),
+                %% Strip brackets for IPv6
+                IP = string:trim(IPStr, both, "[]"),
+                {ok, IP, Port}
+            catch
+                _:_ -> {error, invalid_port}
+            end;
+        _ ->
+            {error, invalid_format}
+    end.
+
+%% Format address info back to connection string
+format_peer_address(#{mode := Mode, address := IP, port := Port}) ->
+    ModeStr = case Mode of
+        local -> "L";
+        public -> "P";
+        stun -> "S"
+    end,
+    io_lib:format("~s:~s:~p", [ModeStr, IP, Port]).
