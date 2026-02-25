@@ -275,128 +275,214 @@ recv_direct(DestDir, Port) ->
 %% Interactive Workflow
 %%===================================================================
 %%
-%% These functions help with the manual P2P connection workflow:
+%% These functions help with the manual P2P connection workflow.
+%% IMPORTANT: The socket must stay open between init and do phases!
 %%
-%% SENDER:                           RECEIVER:
-%% 1. init_send() -> ConnStr         1. init_receive() -> ConnStr
-%% 2. Share ConnStr with receiver    2. Share ConnStr with sender
-%% 3. do_send(File, RecvConnStr)     3. do_receive(Dir, SendConnStr)
+%% SENDER:                                    RECEIVER:
+%% 1. {ok, Ctx} = init_send()                 1. {ok, Ctx} = init_receive()
+%% 2. Share Ctx.conn_str with receiver        2. Share Ctx.conn_str with sender
+%% 3. do_send(Ctx, File, RecvConnStr)         3. do_receive(Ctx, Dir, SendConnStr)
+%%
+%% The Ctx (context) keeps the socket alive so the NAT mapping is preserved.
 %%
 
-%% @doc Initialize as sender - returns connection string to share.
--spec init_send() -> {ok, string()} | {error, term()}.
+-record(p2p_ctx, {
+    socket :: gen_udp:socket(),
+    local_port :: inet:port_number(),
+    public_addr :: {inet:ip_address(), inet:port_number()},
+    conn_str :: string()
+}).
+
+%% @doc Initialize as sender - returns context with socket kept open.
+-spec init_send() -> {ok, #p2p_ctx{}} | {error, term()}.
 init_send() ->
-    case discover() of
-        {ok, {IP, Port}} ->
-            %% Get our fingerprint for verification
-            {ok, FP} = pperl_identity:get_fingerprint(),
-            %% Format: IP:Port:Fingerprint (truncated)
-            ShortFP = binary:part(FP, 0, 16),
-            ConnStr = io_lib:format("~s:~p:~s", [inet:ntoa(IP), Port, ShortFP]),
-            {ok, lists:flatten(ConnStr)};
-        {error, _} = Err ->
-            Err
-    end.
+    io:format("~n=== INIT SENDER ===~n"),
 
-%% @doc Initialize as receiver - returns connection string to share.
--spec init_receive() -> {ok, string(), inet:port_number()} | {error, term()}.
-init_receive() ->
-    %% Open a listening socket first to get our port
-    case gen_udp:open(0, [binary]) of
-        {ok, Sock} ->
-            {ok, LocalPort} = inet:port(Sock),
-            gen_udp:close(Sock),
+    %% Open UDP socket
+    case gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]) of
+        {ok, Socket} ->
+            {ok, LocalPort} = inet:port(Socket),
+            io:format("[init_send] Local port: ~p~n", [LocalPort]),
 
-            %% Now discover our public address using that knowledge
-            %% (In practice, the NAT mapping might use a different port)
-            case discover() of
-                {ok, {IP, _StunPort}} ->
+            %% Do STUN to get our public address
+            io:format("[init_send] Doing STUN...~n"),
+            case stun_with_socket(Socket) of
+                {ok, {PubIP, PubPort} = PubAddr} ->
+                    io:format("[init_send] Public address: ~s:~p~n",
+                              [inet:ntoa(PubIP), PubPort]),
+
+                    %% Build connection string
                     {ok, FP} = pperl_identity:get_fingerprint(),
                     ShortFP = binary:part(FP, 0, 16),
-                    %% Use local port - hope NAT preserves it (works for many NATs)
-                    ConnStr = io_lib:format("~s:~p:~s", [inet:ntoa(IP), LocalPort, ShortFP]),
-                    {ok, lists:flatten(ConnStr), LocalPort};
+                    ConnStr = lists:flatten(
+                        io_lib:format("~s:~p:~s", [inet:ntoa(PubIP), PubPort, ShortFP])),
+
+                    io:format("~n>>> Your connection string: ~s~n", [ConnStr]),
+                    io:format("~nShare this with receiver, get their string, then run:~n"),
+                    io:format("  pperl_p2p:do_send(Ctx, \"file.txt\", \"<receiver_conn_str>\").~n~n"),
+
+                    Ctx = #p2p_ctx{
+                        socket = Socket,
+                        local_port = LocalPort,
+                        public_addr = PubAddr,
+                        conn_str = ConnStr
+                    },
+                    {ok, Ctx};
                 {error, _} = Err ->
+                    gen_udp:close(Socket),
+                    io:format("[init_send] STUN failed: ~p~n", [Err]),
                     Err
             end;
         {error, _} = Err ->
+            io:format("[init_send] Failed to open socket: ~p~n", [Err]),
             Err
     end.
 
-%% @doc Send a file using peer's connection string.
--spec do_send(string(), string()) -> ok | {error, term()}.
-do_send(FilePath, PeerConnStr) ->
+%% @doc Initialize as receiver - returns context with socket kept open.
+-spec init_receive() -> {ok, #p2p_ctx{}} | {error, term()}.
+init_receive() ->
+    io:format("~n=== INIT RECEIVER ===~n"),
+
+    %% Open UDP socket
+    case gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]) of
+        {ok, Socket} ->
+            {ok, LocalPort} = inet:port(Socket),
+            io:format("[init_receive] Local port: ~p~n", [LocalPort]),
+
+            %% Do STUN to get our public address
+            io:format("[init_receive] Doing STUN...~n"),
+            case stun_with_socket(Socket) of
+                {ok, {PubIP, PubPort} = PubAddr} ->
+                    io:format("[init_receive] Public address: ~s:~p~n",
+                              [inet:ntoa(PubIP), PubPort]),
+
+                    %% Build connection string
+                    {ok, FP} = pperl_identity:get_fingerprint(),
+                    ShortFP = binary:part(FP, 0, 16),
+                    ConnStr = lists:flatten(
+                        io_lib:format("~s:~p:~s", [inet:ntoa(PubIP), PubPort, ShortFP])),
+
+                    io:format("~n>>> Your connection string: ~s~n", [ConnStr]),
+                    io:format("~nShare this with sender, get their string, then run:~n"),
+                    io:format("  pperl_p2p:do_receive(Ctx, \"/dest/dir\", \"<sender_conn_str>\").~n~n"),
+
+                    Ctx = #p2p_ctx{
+                        socket = Socket,
+                        local_port = LocalPort,
+                        public_addr = PubAddr,
+                        conn_str = ConnStr
+                    },
+                    {ok, Ctx};
+                {error, _} = Err ->
+                    gen_udp:close(Socket),
+                    io:format("[init_receive] STUN failed: ~p~n", [Err]),
+                    Err
+            end;
+        {error, _} = Err ->
+            io:format("[init_receive] Failed to open socket: ~p~n", [Err]),
+            Err
+    end.
+
+%% @doc Send a file using the context from init_send().
+-spec do_send(#p2p_ctx{}, string(), string()) -> ok | {error, term()}.
+do_send(#p2p_ctx{socket = UdpSocket, local_port = LocalPort}, FilePath, PeerConnStr) ->
     case parse_conn_str(PeerConnStr) of
         {ok, PeerIP, PeerPort, _PeerFP} ->
-            io:format("Connecting to ~s:~p~n", [inet:ntoa(PeerIP), PeerPort]),
-            case connect(PeerIP, PeerPort) of
-                {ok, Socket} ->
-                    Result = pperl_transfer:send_file(Socket, FilePath,
-                                                       filename:basename(FilePath)),
-                    ssl:close(Socket),
-                    Result;
+            io:format("~n=== SEND to ~s:~p ===~n", [inet:ntoa(PeerIP), PeerPort]),
+
+            %% Open a second socket for continuous punching during DTLS
+            {ok, PunchSocket} = gen_udp:open(LocalPort,
+                [binary, {active, false}, {reuseaddr, true}]),
+
+            %% Start continuous puncher
+            io:format("[send] Starting continuous hole punching...~n"),
+            Puncher = start_puncher(PunchSocket, PeerIP, PeerPort),
+
+            %% Prepare the main socket for DTLS
+            pperl_udp_transport:prepare(UdpSocket, LocalPort),
+
+            %% Connect via DTLS
+            io:format("[send] Attempting DTLS connect...~n"),
+            Result = case dtls_connect_punched(PeerIP, PeerPort, LocalPort, ?CONNECT_TIMEOUT) of
+                {ok, DtlsSocket} ->
+                    io:format("[send] Connected! Sending file...~n"),
+                    SendResult = pperl_transfer:send_file(DtlsSocket, FilePath,
+                                                          filename:basename(FilePath)),
+                    ssl:close(DtlsSocket),
+                    SendResult;
                 {error, _} = Err ->
                     Err
-            end;
+            end,
+
+            %% Stop puncher
+            stop_puncher(Puncher),
+            gen_udp:close(PunchSocket),
+
+            case Result of
+                ok -> io:format("[send] SUCCESS!~n");
+                {error, E} -> io:format("[send] FAILED: ~p~n", [E])
+            end,
+            Result;
         {error, _} = Err ->
+            io:format("[send] Invalid connection string: ~p~n", [Err]),
             Err
     end.
 
-%% @doc Receive a file using sender's connection string for hole punching.
--spec do_receive(string(), string()) -> {ok, string()} | {error, term()}.
-do_receive(DestDir, PeerConnStr) ->
+%% @doc Receive a file using the context from init_receive().
+-spec do_receive(#p2p_ctx{}, string(), string()) -> {ok, string()} | {error, term()}.
+do_receive(#p2p_ctx{socket = UdpSocket, local_port = LocalPort}, DestDir, PeerConnStr) ->
     case parse_conn_str(PeerConnStr) of
         {ok, PeerIP, PeerPort, _PeerFP} ->
             io:format("~n=== RECEIVE from ~s:~p ===~n", [inet:ntoa(PeerIP), PeerPort]),
 
-            %% Open UDP socket and do STUN + hole punching
-            case gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]) of
-                {ok, UdpSocket} ->
-                    {ok, LocalPort} = inet:port(UdpSocket),
-                    io:format("[receive] Local UDP port: ~p~n", [LocalPort]),
+            %% Open a second socket for continuous punching during DTLS
+            {ok, PunchSocket} = gen_udp:open(LocalPort,
+                [binary, {active, false}, {reuseaddr, true}]),
 
-                    %% Do STUN to establish NAT mapping
-                    io:format("[receive] Doing STUN...~n"),
-                    case stun_with_socket(UdpSocket) of
-                        {ok, OurPublic} ->
-                            io:format("[receive] Our public address: ~p~n", [OurPublic]),
+            %% Start continuous puncher
+            io:format("[receive] Starting continuous hole punching...~n"),
+            Puncher = start_puncher(PunchSocket, PeerIP, PeerPort),
 
-                            %% Open a second socket for continuous punching
-                            {ok, PunchSocket} = gen_udp:open(LocalPort,
-                                [binary, {active, false}, {reuseaddr, true}]),
+            %% Prepare the main socket for DTLS
+            pperl_udp_transport:prepare(UdpSocket, LocalPort),
 
-                            %% Start continuous puncher
-                            io:format("[receive] Starting continuous hole punching...~n"),
-                            Puncher = start_puncher(PunchSocket, PeerIP, PeerPort),
+            %% Accept connection
+            io:format("[receive] Waiting for DTLS connection...~n"),
+            Result = accept_punched(LocalPort, DestDir),
 
-                            %% Prepare main socket for DTLS
-                            pperl_udp_transport:prepare(UdpSocket, LocalPort),
+            %% Stop puncher
+            stop_puncher(Puncher),
+            gen_udp:close(PunchSocket),
 
-                            %% Accept connection (puncher keeps running)
-                            io:format("[receive] Waiting for DTLS connection...~n"),
-                            Result = accept_punched(LocalPort, DestDir),
-
-                            %% Stop puncher
-                            stop_puncher(Puncher),
-                            gen_udp:close(PunchSocket),
-
-                            case Result of
-                                {ok, _} -> io:format("[receive] SUCCESS!~n");
-                                {error, E} -> io:format("[receive] FAILED: ~p~n", [E])
-                            end,
-                            Result;
-                        {error, _} = Err ->
-                            io:format("[receive] STUN failed: ~p~n", [Err]),
-                            gen_udp:close(UdpSocket),
-                            Err
-                    end;
-                {error, _} = Err ->
-                    io:format("[receive] Failed to open socket: ~p~n", [Err]),
-                    Err
-            end;
+            case Result of
+                {ok, _} -> io:format("[receive] SUCCESS!~n");
+                {error, E} -> io:format("[receive] FAILED: ~p~n", [E])
+            end,
+            Result;
         {error, _} = Err ->
             io:format("[receive] Invalid connection string: ~p~n", [Err]),
             Err
+    end.
+
+%% Legacy wrappers for backwards compatibility (create new socket each time - not recommended)
+%% @doc Legacy: Send without pre-initialized context (creates new socket).
+-spec do_send(string(), string()) -> ok | {error, term()}.
+do_send(FilePath, PeerConnStr) ->
+    io:format("WARNING: Using legacy do_send/2 - creating new socket~n"),
+    io:format("         Recommended: use init_send() then do_send/3~n~n"),
+    case init_send() of
+        {ok, Ctx} -> do_send(Ctx, FilePath, PeerConnStr);
+        {error, _} = Err -> Err
+    end.
+
+%% @doc Legacy: Receive without pre-initialized context (creates new socket).
+-spec do_receive(string(), string()) -> {ok, string()} | {error, term()}.
+do_receive(DestDir, PeerConnStr) ->
+    io:format("WARNING: Using legacy do_receive/2 - creating new socket~n"),
+    io:format("         Recommended: use init_receive() then do_receive/3~n~n"),
+    case init_receive() of
+        {ok, Ctx} -> do_receive(Ctx, DestDir, PeerConnStr);
+        {error, _} = Err -> Err
     end.
 
 %% Parse connection string "IP:Port:Fingerprint"

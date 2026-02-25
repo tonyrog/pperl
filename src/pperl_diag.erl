@@ -13,7 +13,8 @@
 -export([
     %% Quick diagnostics
     probe/0,              %% Get our public address and connection string
-    test_punch/1,         %% Test hole punching with peer
+    test_punch/1,         %% Test hole punching with peer (new socket - quick test)
+    test_punch/2,         %% Test hole punching with existing socket (correct way)
 
     %% Lower level tools
     stun_info/0,          %% Detailed STUN information
@@ -23,6 +24,8 @@
     %% NAT type detection
     nat_type/0
 ]).
+
+-export([parse_addr/1]).
 
 -define(STUN_SERVERS, [
     {"stun.l.google.com", 19302},
@@ -35,7 +38,8 @@
 %%===================================================================
 
 %% @doc Get our public address and generate a connection string.
--spec probe() -> ok.
+%% Returns the socket so it can be reused for test_punch.
+-spec probe() -> {ok, gen_udp:socket(), string()} | error.
 probe() ->
     io:format("~n=== PPERL Network Diagnostic ===~n~n"),
 
@@ -46,7 +50,7 @@ probe() ->
     io:format("Local interfaces:~n"),
     lists:foreach(fun({Name, Props}) ->
         case proplists:get_value(addr, Props) of
-            {A,B,C,D} = Addr when A =/= 127 ->
+            {_,_,_,_} = Addr when element(1, Addr) =/= 127 ->
                 io:format("  ~s: ~s~n", [Name, inet:ntoa(Addr)]);
             _ -> ok
         end
@@ -72,31 +76,63 @@ probe() ->
             end,
 
             %% Generate connection string
-            ConnStr = io_lib:format("~s:~p", [inet:ntoa(PubIP), PubPort]),
+            ConnStr = lists:flatten(io_lib:format("~s:~p", [inet:ntoa(PubIP), PubPort])),
             io:format("~n>>> Connection string: ~s~n", [ConnStr]),
-            io:format("~nShare this with your peer, then run:~n"),
+            io:format("~nSocket kept open! Now run:~n"),
+            io:format("  pperl_diag:test_punch(Socket, \"<peer_conn_string>\").~n"),
+            io:format("~nOr for quick test (new socket each time):~n"),
             io:format("  pperl_diag:test_punch(\"<peer_conn_string>\").~n~n"),
 
-            gen_udp:close(Socket),
-            ok;
+            {ok, Socket, ConnStr};
         {error, Reason} ->
             io:format("STUN failed: ~p~n", [Reason]),
             io:format("Check your internet connection.~n"),
             error
     end.
 
-%% @doc Test hole punching with a peer. Run this on BOTH sides simultaneously.
+%% @doc Test hole punching with a peer using an existing socket from probe().
+%% This is the CORRECT way - uses the same socket that generated your connection string.
+-spec test_punch(gen_udp:socket(), string()) -> ok | {error, term()}.
+test_punch(Socket, PeerConnStr) ->
+    case parse_addr(PeerConnStr) of
+        {ok, PeerIP, PeerPort} ->
+            io:format("~n=== Hole Punch Test to ~s:~p ===~n~n",
+                      [inet:ntoa(PeerIP), PeerPort]),
+
+            %% Get info about our socket
+            {ok, LocalPort} = inet:port(Socket),
+            io:format("Using existing socket on local port ~p~n", [LocalPort]),
+            io:format("~nStarting bidirectional test...~n"),
+            io:format("(Run this on BOTH machines at the same time!)~n~n"),
+
+            %% Set socket to active mode for receiving
+            inet:setopts(Socket, [{active, true}]),
+
+            %% Run test for 30 seconds
+            run_punch_test(Socket, PeerIP, PeerPort, 30000),
+
+            io:format("~nSocket still open - you can run test_punch again.~n"),
+            ok;
+        {error, Reason} ->
+            io:format("Invalid connection string: ~p~n", [Reason]),
+            {error, invalid_conn_str}
+    end.
+
+%% @doc Test hole punching with a NEW socket (quick test, may use different port!)
+%% WARNING: This creates a new socket, so the port may differ from what you shared.
 -spec test_punch(string()) -> ok | {error, term()}.
 test_punch(PeerConnStr) ->
     case parse_addr(PeerConnStr) of
         {ok, PeerIP, PeerPort} ->
             io:format("~n=== Hole Punch Test to ~s:~p ===~n~n",
                       [inet:ntoa(PeerIP), PeerPort]),
+            io:format("WARNING: Creating new socket - port may differ from probe()!~n"),
+            io:format("         For accurate test, use: test_punch(Socket, PeerStr)~n~n"),
 
-            %% Get our public address
+            %% Get our public address with new socket
             case stun_probe() of
                 {ok, Socket, LocalPort, {OurIP, OurPort}} ->
-                    io:format("Our address: ~s:~p (local port ~p)~n",
+                    io:format("This socket: ~s:~p (local port ~p)~n",
                               [inet:ntoa(OurIP), OurPort, LocalPort]),
                     io:format("~nStarting bidirectional test...~n"),
                     io:format("(Run this on BOTH machines at the same time!)~n~n"),
