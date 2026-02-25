@@ -34,8 +34,9 @@
     init_send/0,       %% Sender: get connection string to share
     init_receive/0,    %% Receiver: get connection string to share
     do_send/2,         %% Sender: send file using peer's connection string
+    do_send/3,
     do_receive/2,      %% Receiver: receive file using peer's connection string
-
+    do_receive/3,
     %% Testing
     test_local/0
 ]).
