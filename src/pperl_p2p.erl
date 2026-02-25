@@ -44,9 +44,9 @@
     {"stun.l.google.com", 19302},
     {"stun1.l.google.com", 19302}
 ]).
--define(HOLE_PUNCH_ATTEMPTS, 10).
--define(HOLE_PUNCH_INTERVAL, 100).
--define(CONNECT_TIMEOUT, 10000).
+-define(HOLE_PUNCH_INTERVAL, 500).   %% 500ms between punches
+-define(HOLE_PUNCH_DURATION, 30000). %% Punch for 30 seconds total
+-define(CONNECT_TIMEOUT, 30000).     %% 30 second connection timeout
 
 %%===================================================================
 %% Discovery
@@ -77,31 +77,51 @@ connect(PeerIP, PeerPort) ->
 -spec connect(inet:ip_address(), inet:port_number(), timeout()) ->
     {ok, ssl:sslsocket()} | {error, term()}.
 connect(PeerIP, PeerPort, Timeout) ->
+    io:format("~n=== CONNECT to ~s:~p ===~n", [inet:ntoa(PeerIP), PeerPort]),
+
     %% Open our UDP socket on a random port
     case gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]) of
         {ok, UdpSocket} ->
             {ok, LocalPort} = inet:port(UdpSocket),
-            io:format("Local UDP port: ~p~n", [LocalPort]),
+            io:format("[connect] Local UDP port: ~p~n", [LocalPort]),
 
             %% Do STUN to establish our NAT mapping
+            io:format("[connect] Doing STUN...~n"),
             case stun_with_socket(UdpSocket) of
                 {ok, OurPublic} ->
-                    io:format("Our public address: ~p~n", [OurPublic]),
+                    io:format("[connect] Our public address: ~p~n", [OurPublic]),
 
-                    %% Hole punch - send packets to peer
-                    io:format("Hole punching to ~p:~p~n", [PeerIP, PeerPort]),
-                    hole_punch(UdpSocket, PeerIP, PeerPort),
+                    %% Open a second socket for continuous punching during DTLS
+                    {ok, PunchSocket} = gen_udp:open(LocalPort,
+                        [binary, {active, false}, {reuseaddr, true}]),
 
-                    %% Prepare the punched socket for DTLS to reuse
+                    %% Start continuous puncher (runs during DTLS handshake)
+                    io:format("[connect] Starting continuous hole punching...~n"),
+                    Puncher = start_puncher(PunchSocket, PeerIP, PeerPort),
+
+                    %% Prepare the main socket for DTLS
                     pperl_udp_transport:prepare(UdpSocket, LocalPort),
 
-                    %% Connect via DTLS reusing the same socket
-                    dtls_connect_punched(PeerIP, PeerPort, LocalPort, Timeout);
+                    %% Connect via DTLS (puncher keeps running)
+                    io:format("[connect] Attempting DTLS connect...~n"),
+                    Result = dtls_connect_punched(PeerIP, PeerPort, LocalPort, Timeout),
+
+                    %% Stop puncher
+                    stop_puncher(Puncher),
+                    gen_udp:close(PunchSocket),
+
+                    case Result of
+                        {ok, _} -> io:format("[connect] SUCCESS!~n");
+                        {error, E} -> io:format("[connect] FAILED: ~p~n", [E])
+                    end,
+                    Result;
                 {error, _} = Err ->
+                    io:format("[connect] STUN failed: ~p~n", [Err]),
                     gen_udp:close(UdpSocket),
                     Err
             end;
         {error, _} = Err ->
+            io:format("[connect] Failed to open socket: ~p~n", [Err]),
             Err
     end.
 
@@ -327,35 +347,55 @@ do_send(FilePath, PeerConnStr) ->
 do_receive(DestDir, PeerConnStr) ->
     case parse_conn_str(PeerConnStr) of
         {ok, PeerIP, PeerPort, _PeerFP} ->
+            io:format("~n=== RECEIVE from ~s:~p ===~n", [inet:ntoa(PeerIP), PeerPort]),
+
             %% Open UDP socket and do STUN + hole punching
             case gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]) of
                 {ok, UdpSocket} ->
                     {ok, LocalPort} = inet:port(UdpSocket),
-                    io:format("Local UDP port: ~p~n", [LocalPort]),
+                    io:format("[receive] Local UDP port: ~p~n", [LocalPort]),
 
                     %% Do STUN to establish NAT mapping
+                    io:format("[receive] Doing STUN...~n"),
                     case stun_with_socket(UdpSocket) of
                         {ok, OurPublic} ->
-                            io:format("Our public address: ~p~n", [OurPublic]),
-                            io:format("Hole punching to ~s:~p~n",
-                                      [inet:ntoa(PeerIP), PeerPort]),
+                            io:format("[receive] Our public address: ~p~n", [OurPublic]),
 
-                            %% Hole punch to peer
-                            hole_punch(UdpSocket, PeerIP, PeerPort),
+                            %% Open a second socket for continuous punching
+                            {ok, PunchSocket} = gen_udp:open(LocalPort,
+                                [binary, {active, false}, {reuseaddr, true}]),
 
-                            %% Prepare punched socket for DTLS
+                            %% Start continuous puncher
+                            io:format("[receive] Starting continuous hole punching...~n"),
+                            Puncher = start_puncher(PunchSocket, PeerIP, PeerPort),
+
+                            %% Prepare main socket for DTLS
                             pperl_udp_transport:prepare(UdpSocket, LocalPort),
 
-                            %% Accept connection using punched socket
-                            accept_punched(LocalPort, DestDir);
+                            %% Accept connection (puncher keeps running)
+                            io:format("[receive] Waiting for DTLS connection...~n"),
+                            Result = accept_punched(LocalPort, DestDir),
+
+                            %% Stop puncher
+                            stop_puncher(Puncher),
+                            gen_udp:close(PunchSocket),
+
+                            case Result of
+                                {ok, _} -> io:format("[receive] SUCCESS!~n");
+                                {error, E} -> io:format("[receive] FAILED: ~p~n", [E])
+                            end,
+                            Result;
                         {error, _} = Err ->
+                            io:format("[receive] STUN failed: ~p~n", [Err]),
                             gen_udp:close(UdpSocket),
                             Err
                     end;
                 {error, _} = Err ->
+                    io:format("[receive] Failed to open socket: ~p~n", [Err]),
                     Err
             end;
         {error, _} = Err ->
+            io:format("[receive] Invalid connection string: ~p~n", [Err]),
             Err
     end.
 
@@ -421,18 +461,62 @@ extract_mapped_address(Attrs) ->
             end
     end.
 
-%% Send hole-punching packets
+%% Send hole-punching packets (blocking, limited duration)
 hole_punch(UdpSocket, PeerIP, PeerPort) ->
-    hole_punch(UdpSocket, PeerIP, PeerPort, ?HOLE_PUNCH_ATTEMPTS).
+    hole_punch(UdpSocket, PeerIP, PeerPort, ?HOLE_PUNCH_DURATION).
 
-hole_punch(_UdpSocket, _PeerIP, _PeerPort, 0) ->
-    ok;
-hole_punch(UdpSocket, PeerIP, PeerPort, N) ->
-    %% Send a simple punch packet
-    Punch = <<"pperl-punch">>,
-    gen_udp:send(UdpSocket, PeerIP, PeerPort, Punch),
-    timer:sleep(?HOLE_PUNCH_INTERVAL),
-    hole_punch(UdpSocket, PeerIP, PeerPort, N - 1).
+hole_punch(UdpSocket, PeerIP, PeerPort, Duration) ->
+    EndTime = erlang:monotonic_time(millisecond) + Duration,
+    hole_punch_loop(UdpSocket, PeerIP, PeerPort, EndTime, 0).
+
+hole_punch_loop(UdpSocket, PeerIP, PeerPort, EndTime, Count) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now < EndTime of
+        true ->
+            Punch = <<"pperl-punch:", (integer_to_binary(Count))/binary>>,
+            case gen_udp:send(UdpSocket, PeerIP, PeerPort, Punch) of
+                ok ->
+                    case Count rem 10 of
+                        0 -> io:format("  [punch] #~p to ~s:~p~n",
+                                       [Count, inet:ntoa(PeerIP), PeerPort]);
+                        _ -> ok
+                    end;
+                {error, E} ->
+                    io:format("  [punch] ERROR: ~p~n", [E])
+            end,
+            timer:sleep(?HOLE_PUNCH_INTERVAL),
+            hole_punch_loop(UdpSocket, PeerIP, PeerPort, EndTime, Count + 1);
+        false ->
+            io:format("  [punch] Done after ~p packets~n", [Count]),
+            ok
+    end.
+
+%% Start continuous hole punching in background (returns pid to stop it)
+start_puncher(UdpSocket, PeerIP, PeerPort) ->
+    spawn_link(fun() ->
+        io:format("  [puncher] Starting continuous punch to ~s:~p~n",
+                  [inet:ntoa(PeerIP), PeerPort]),
+        puncher_loop(UdpSocket, PeerIP, PeerPort, 0)
+    end).
+
+puncher_loop(UdpSocket, PeerIP, PeerPort, Count) ->
+    receive
+        stop ->
+            io:format("  [puncher] Stopped after ~p packets~n", [Count]),
+            ok
+    after 0 ->
+        Punch = <<"pperl-punch:", (integer_to_binary(Count))/binary>>,
+        gen_udp:send(UdpSocket, PeerIP, PeerPort, Punch),
+        case Count rem 20 of
+            0 -> io:format("  [puncher] #~p~n", [Count]);
+            _ -> ok
+        end,
+        timer:sleep(?HOLE_PUNCH_INTERVAL),
+        puncher_loop(UdpSocket, PeerIP, PeerPort, Count + 1)
+    end.
+
+stop_puncher(Pid) ->
+    Pid ! stop.
 
 %% DTLS connect reusing a pre-punched socket via custom transport
 dtls_connect_punched(PeerIP, PeerPort, LocalPort, Timeout) ->
