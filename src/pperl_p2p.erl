@@ -37,6 +37,8 @@
     do_send/3,
     do_receive/2,      %% Receiver: receive file using peer's connection string
     do_receive/3,
+    stop_keepalive/1,  %% Stop NAT keepalive (called automatically by do_*)
+
     %% Testing
     test_local/0
 ]).
@@ -291,7 +293,8 @@ recv_direct(DestDir, Port) ->
     socket :: gen_udp:socket(),
     local_port :: inet:port_number(),
     public_addr :: {inet:ip_address(), inet:port_number()},
-    conn_str :: string()
+    conn_str :: string(),
+    keepalive :: pid() | undefined  %% Background process keeping NAT mapping alive
 }).
 
 %% @doc Initialize as sender - returns context with socket kept open.
@@ -322,11 +325,16 @@ init_send() ->
                     io:format("~nShare this with receiver, get their string, then run:~n"),
                     io:format("  pperl_p2p:do_send(Ctx, \"file.txt\", \"<receiver_conn_str>\").~n~n"),
 
+                    %% Start keepalive to maintain NAT mapping while user exchanges strings
+                    Keepalive = start_keepalive(Socket, LocalPort),
+                    io:format("[init_send] NAT keepalive started (refreshes every 10s)~n"),
+
                     Ctx = #p2p_ctx{
                         socket = Socket,
                         local_port = LocalPort,
                         public_addr = PubAddr,
-                        conn_str = ConnStr
+                        conn_str = ConnStr,
+                        keepalive = Keepalive
                     },
                     {ok, Ctx};
                 {error, _} = Err ->
@@ -367,11 +375,16 @@ init_receive() ->
                     io:format("~nShare this with sender, get their string, then run:~n"),
                     io:format("  pperl_p2p:do_receive(Ctx, \"/dest/dir\", \"<sender_conn_str>\").~n~n"),
 
+                    %% Start keepalive to maintain NAT mapping while user exchanges strings
+                    Keepalive = start_keepalive(Socket, LocalPort),
+                    io:format("[init_receive] NAT keepalive started (refreshes every 10s)~n"),
+
                     Ctx = #p2p_ctx{
                         socket = Socket,
                         local_port = LocalPort,
                         public_addr = PubAddr,
-                        conn_str = ConnStr
+                        conn_str = ConnStr,
+                        keepalive = Keepalive
                     },
                     {ok, Ctx};
                 {error, _} = Err ->
@@ -386,7 +399,10 @@ init_receive() ->
 
 %% @doc Send a file using the context from init_send().
 -spec do_send(#p2p_ctx{}, string(), string()) -> ok | {error, term()}.
-do_send(#p2p_ctx{socket = UdpSocket, local_port = LocalPort}, FilePath, PeerConnStr) ->
+do_send(#p2p_ctx{socket = UdpSocket, local_port = LocalPort, keepalive = Keepalive}, FilePath, PeerConnStr) ->
+    %% Stop keepalive - we're now actively connecting
+    stop_keepalive(Keepalive),
+
     case parse_conn_str(PeerConnStr) of
         {ok, PeerIP, PeerPort, _PeerFP} ->
             io:format("~n=== SEND to ~s:~p ===~n", [inet:ntoa(PeerIP), PeerPort]),
@@ -431,7 +447,10 @@ do_send(#p2p_ctx{socket = UdpSocket, local_port = LocalPort}, FilePath, PeerConn
 
 %% @doc Receive a file using the context from init_receive().
 -spec do_receive(#p2p_ctx{}, string(), string()) -> {ok, string()} | {error, term()}.
-do_receive(#p2p_ctx{socket = UdpSocket, local_port = LocalPort}, DestDir, PeerConnStr) ->
+do_receive(#p2p_ctx{socket = UdpSocket, local_port = LocalPort, keepalive = Keepalive}, DestDir, PeerConnStr) ->
+    %% Stop keepalive - we're now actively connecting
+    stop_keepalive(Keepalive),
+
     case parse_conn_str(PeerConnStr) of
         {ok, PeerIP, PeerPort, _PeerFP} ->
             io:format("~n=== RECEIVE from ~s:~p ===~n", [inet:ntoa(PeerIP), PeerPort]),
@@ -603,6 +622,55 @@ puncher_loop(UdpSocket, PeerIP, PeerPort, Count) ->
     end.
 
 stop_puncher(Pid) ->
+    Pid ! stop.
+
+%% NAT keepalive - periodically sends STUN binding request to keep NAT mapping alive
+%% This runs in the background while user is exchanging connection strings
+-define(KEEPALIVE_INTERVAL, 10000).  %% 10 seconds
+
+start_keepalive(Socket, LocalPort) ->
+    %% Open a second socket on same port for keepalive
+    case gen_udp:open(LocalPort, [binary, {active, false}, {reuseaddr, true}]) of
+        {ok, KeepaliveSocket} ->
+            spawn_link(fun() -> keepalive_loop(KeepaliveSocket, 0) end);
+        {error, _} ->
+            %% Fallback: use main socket (less ideal but works)
+            spawn_link(fun() -> keepalive_loop(Socket, 0) end)
+    end.
+
+keepalive_loop(Socket, Count) ->
+    receive
+        stop ->
+            io:format("  [keepalive] Stopped after ~p refreshes~n", [Count]),
+            %% Don't close the socket - it might be the main one
+            ok
+    after ?KEEPALIVE_INTERVAL ->
+        %% Send STUN binding request to refresh NAT mapping
+        case send_stun_keepalive(Socket) of
+            ok ->
+                case Count rem 6 of  %% Log every minute
+                    0 -> io:format("  [keepalive] NAT refresh #~p~n", [Count]);
+                    _ -> ok
+                end;
+            {error, E} ->
+                io:format("  [keepalive] ERROR: ~p~n", [E])
+        end,
+        keepalive_loop(Socket, Count + 1)
+    end.
+
+send_stun_keepalive(Socket) ->
+    %% Send to Google STUN server to refresh NAT mapping
+    {Request, _TxnId} = stun_codec:binding_request(),
+    case inet:getaddr("stun.l.google.com", inet) of
+        {ok, IP} ->
+            gen_udp:send(Socket, IP, 19302, Request);
+        {error, _} = Err ->
+            Err
+    end.
+
+stop_keepalive(undefined) ->
+    ok;
+stop_keepalive(Pid) when is_pid(Pid) ->
     Pid ! stop.
 
 %% DTLS connect reusing a pre-punched socket via custom transport

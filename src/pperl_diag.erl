@@ -206,13 +206,11 @@ drain_recv(Socket, Count, LastSeq) ->
     receive
         {udp, Socket, FromIP, FromPort, <<"DIAG:", Rest/binary>>} ->
             case binary:split(Rest, <<":">>) of
-                [SeqBin, TimeBin] ->
+                [SeqBin, _TimeBin] ->
                     Seq = binary_to_integer(SeqBin),
-                    SendTime = binary_to_integer(TimeBin),
-                    Now = erlang:monotonic_time(millisecond),
-                    Latency = Now - SendTime,
-                    io:format("  << RECV #~p from ~s:~p (latency: ~pms)~n",
-                              [Seq, inet:ntoa(FromIP), FromPort, Latency]),
+                    %% Note: Can't calculate latency - monotonic_time is local to each machine
+                    io:format("  << RECV #~p from ~s:~p~n",
+                              [Seq, inet:ntoa(FromIP), FromPort]),
                     drain_recv(Socket, Count + 1, Seq);
                 _ ->
                     drain_recv(Socket, Count + 1, LastSeq)
