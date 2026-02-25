@@ -268,15 +268,20 @@ do_receive(DestDir, PeerConnStr) ->
 
 %% Parse connection string "IP:Port:Fingerprint"
 parse_conn_str(ConnStr) ->
-    case string:split(ConnStr, ":", all) of
-        [IPStr, PortStr, FPStr] ->
-            case inet:parse_address(IPStr) of
-                {ok, IP} ->
-                    Port = list_to_integer(PortStr),
-                    {ok, IP, Port, FPStr};
-                {error, _} ->
-                    {error, invalid_ip}
-            end;
+    case string:split(ConnStr, ":") of
+        [IPStr, ConnStr1] ->
+	    case string:split(ConnStr1, ":") of
+		[PortStr, FPStr] ->
+		    case inet:parse_address(IPStr) of
+			{ok, IP} ->
+			    Port = list_to_integer(PortStr),
+			    {ok, IP, Port, FPStr};
+			{error, _} ->
+			    {error, invalid_ip}
+		    end;
+		_ ->
+		    {error, invalid_format}
+	    end;
         _ ->
             {error, invalid_format}
     end.
