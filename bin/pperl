@@ -32,15 +32,34 @@ main(Args) ->
         ["send", File, Peer] ->
             cmd_send(File, Peer);
         ["recv"] ->
-            cmd_recv(".", undefined);
-        ["recv", DirOrPeer] ->
+            cmd_recv(".", undefined, 7700);
+        ["recv", DirOrPeerOrPort] ->
             %% Could be dir or peer name - check if it's a peer
-            case pperl_identity:get_peer_address(DirOrPeer) of
-                {ok, _} -> cmd_recv(".", DirOrPeer);
-                {error, _} -> cmd_recv(DirOrPeer, undefined)
+            case pperl_identity:get_peer_address(DirOrPeerOrPort) of
+                {ok, _} -> 
+		    Peer = DirOrPeerOrPort,
+		    cmd_recv(".", Peer, 7700);
+                {error, _} ->
+		    try list_to_integer(DirOrPeerOrPort) of
+			Port ->
+			    cmd_recv(".", undefined, Port)
+		    catch
+			error:_ ->
+			    Dir = DirOrPeerOrPort,
+			    cmd_recv(Dir, undefined, 7700)
+		    end
             end;
-        ["recv", Peer, Dir] ->
-            cmd_recv(Dir, Peer);
+        ["recv", Peer, DirOrPort] ->
+	    try list_to_integer(DirOrPort) of
+		Port ->
+		    cmd_recv(".", Peer, Port)
+	    catch
+		error:_ ->
+		    Dir = DirOrPort,
+		    cmd_recv(Dir, Peer, 7700)
+	    end;
+        ["recv", Peer, Dir, Port] ->
+            cmd_recv(Dir, Peer, list_to_integer(Port));
         ["pending"] ->
             cmd_pending();
         ["help"] ->
@@ -75,7 +94,7 @@ cmd_help() ->
     io:format("~n"),
     io:format("Transfer:~n"),
     io:format("  pperl send <file> [peer]  Send a file (direct if peer has address)~n"),
-    io:format("  pperl recv [peer] [dir]   Receive a file~n"),
+    io:format("  pperl recv [peer] [dir] [port] Receive a file~n"),
     io:format("  pperl pending             List incomplete transfers~n"),
     io:format("~n"),
     io:format("Workflow:~n"),
@@ -282,7 +301,7 @@ cmd_send_stun(FilePath) ->
             halt(1)
     end.
 
-cmd_recv(DestDir, PeerName) ->
+cmd_recv(DestDir, PeerName, ListenPort) ->
     check_identity(),
 
     case filelib:is_dir(DestDir) of
@@ -302,7 +321,7 @@ cmd_recv(DestDir, PeerName) ->
             %% Peer specified - listen for direct connection
             case pperl_identity:get_peer_address(PeerName) of
                 {ok, #{mode := Mode}} when Mode =:= local; Mode =:= public ->
-                    cmd_recv_direct(DestDir, PeerName);
+                    cmd_recv_direct(DestDir, PeerName, ListenPort);
                 {ok, #{mode := stun}} ->
                     io:format("Peer '~s' uses STUN mode, falling back to exchange flow.~n~n", [PeerName]),
                     cmd_recv_stun(DestDir);
@@ -316,8 +335,7 @@ cmd_recv(DestDir, PeerName) ->
             end
     end.
 
-cmd_recv_direct(DestDir, PeerName) ->
-    Port = 7700,  %% Default listen port
+cmd_recv_direct(DestDir, PeerName, Port) ->
     io:format("Waiting for ~s on port ~p...~n", [PeerName, Port]),
     case pperl_p2p:recv_direct(DestDir, Port) of
         {ok, Path} ->

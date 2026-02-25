@@ -78,7 +78,7 @@ connect(PeerIP, PeerPort) ->
     {ok, ssl:sslsocket()} | {error, term()}.
 connect(PeerIP, PeerPort, Timeout) ->
     %% Open our UDP socket on a random port
-    case gen_udp:open(0, [binary, {active, false}]) of
+    case gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]) of
         {ok, UdpSocket} ->
             {ok, LocalPort} = inet:port(UdpSocket),
             io:format("Local UDP port: ~p~n", [LocalPort]),
@@ -92,12 +92,11 @@ connect(PeerIP, PeerPort, Timeout) ->
                     io:format("Hole punching to ~p:~p~n", [PeerIP, PeerPort]),
                     hole_punch(UdpSocket, PeerIP, PeerPort),
 
-                    %% Now try DTLS connection
-                    %% Close UDP socket first - DTLS will open its own
-                    gen_udp:close(UdpSocket),
+                    %% Prepare the punched socket for DTLS to reuse
+                    pperl_udp_transport:prepare(UdpSocket, LocalPort),
 
-                    %% Connect via DTLS using the same local port
-                    dtls_connect(PeerIP, PeerPort, LocalPort, Timeout);
+                    %% Connect via DTLS reusing the same socket
+                    dtls_connect_punched(PeerIP, PeerPort, LocalPort, Timeout);
                 {error, _} = Err ->
                     gen_udp:close(UdpSocket),
                     Err
@@ -135,6 +134,44 @@ accept(LocalPort, Timeout) ->
             ssl:close(ListenSocket),
             Result;
         {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Accept using a pre-punched socket via custom transport.
+-spec accept_punched(inet:port_number(), string()) -> {ok, string()} | {error, term()}.
+accept_punched(LocalPort, DestDir) ->
+    accept_punched(LocalPort, DestDir, ?CONNECT_TIMEOUT).
+
+-spec accept_punched(inet:port_number(), string(), timeout()) -> {ok, string()} | {error, term()}.
+accept_punched(LocalPort, DestDir, Timeout) ->
+    application:ensure_all_started(ssl),
+    SslOpts = pperl_identity:ssl_options(server) ++ [
+        {reuseaddr, true},
+        {active, false},
+        {mode, binary},
+        %% Use custom transport to reuse punched socket
+        {cb_info, {pperl_udp_transport, udp, udp_closed, udp_error, udp_passive}}
+    ],
+    case ssl:listen(LocalPort, SslOpts) of
+        {ok, ListenSocket} ->
+            io:format("Listening on port ~p (punched socket)~n", [LocalPort]),
+            Result = case ssl:transport_accept(ListenSocket, Timeout) of
+                {ok, Socket} ->
+                    case ssl:handshake(Socket, Timeout) of
+                        {ok, SslSocket} ->
+                            %% Receive the file
+                            FileResult = pperl_transfer:recv_file(SslSocket, DestDir),
+                            ssl:close(SslSocket),
+                            FileResult;
+                        {error, _} = Err -> Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end,
+            ssl:close(ListenSocket),
+            Result;
+        {error, _} = Err ->
+            pperl_udp_transport:unprepare(LocalPort),
             Err
     end.
 
@@ -290,27 +327,34 @@ do_send(FilePath, PeerConnStr) ->
 do_receive(DestDir, PeerConnStr) ->
     case parse_conn_str(PeerConnStr) of
         {ok, PeerIP, PeerPort, _PeerFP} ->
-            %% We need to:
-            %% 1. Listen on our port
-            %% 2. Hole punch to peer
-            %% 3. Accept their connection
+            %% Open UDP socket and do STUN + hole punching
+            case gen_udp:open(0, [binary, {active, false}, {reuseaddr, true}]) of
+                {ok, UdpSocket} ->
+                    {ok, LocalPort} = inet:port(UdpSocket),
+                    io:format("Local UDP port: ~p~n", [LocalPort]),
 
-            %% First, get our own address
-            {ok, _OurConnStr, LocalPort} = init_receive(),
+                    %% Do STUN to establish NAT mapping
+                    case stun_with_socket(UdpSocket) of
+                        {ok, OurPublic} ->
+                            io:format("Our public address: ~p~n", [OurPublic]),
+                            io:format("Hole punching to ~s:~p~n",
+                                      [inet:ntoa(PeerIP), PeerPort]),
 
-            io:format("Listening on port ~p, hole punching to ~s:~p~n",
-                      [LocalPort, inet:ntoa(PeerIP), PeerPort]),
+                            %% Hole punch to peer
+                            hole_punch(UdpSocket, PeerIP, PeerPort),
 
-            %% Start hole punching in background
-            spawn(fun() ->
-                {ok, Sock} = gen_udp:open(LocalPort, [binary, {reuseaddr, true}]),
-                hole_punch(Sock, PeerIP, PeerPort),
-                gen_udp:close(Sock)
-            end),
+                            %% Prepare punched socket for DTLS
+                            pperl_udp_transport:prepare(UdpSocket, LocalPort),
 
-            %% Accept connection
-            timer:sleep(500), %% Let hole punching start
-            receive_file_from(LocalPort, DestDir);
+                            %% Accept connection using punched socket
+                            accept_punched(LocalPort, DestDir);
+                        {error, _} = Err ->
+                            gen_udp:close(UdpSocket),
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -390,21 +434,29 @@ hole_punch(UdpSocket, PeerIP, PeerPort, N) ->
     timer:sleep(?HOLE_PUNCH_INTERVAL),
     hole_punch(UdpSocket, PeerIP, PeerPort, N - 1).
 
-%% DTLS connect with specific local port
-dtls_connect(PeerIP, PeerPort, LocalPort, Timeout) ->
+%% DTLS connect reusing a pre-punched socket via custom transport
+dtls_connect_punched(PeerIP, PeerPort, LocalPort, Timeout) ->
     application:ensure_all_started(ssl),
     SslOpts = pperl_identity:ssl_options(client) ++ [
         {active, false},
         {mode, binary},
-        {port, LocalPort},  %% Use same local port for NAT binding
-        {reuseaddr, true}
+        {port, LocalPort},
+        {reuseaddr, true},
+        %% Use custom transport to reuse the punched socket
+        {cb_info, {pperl_udp_transport, udp, udp_closed, udp_error, udp_passive}}
     ],
-    %% Convert IP tuple to string if needed
     Host = case PeerIP of
         {A,B,C,D} -> inet:ntoa({A,B,C,D});
         _ -> PeerIP
     end,
-    ssl:connect(Host, PeerPort, SslOpts, Timeout).
+    case ssl:connect(Host, PeerPort, SslOpts, Timeout) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, _} = Err ->
+            %% Clean up prepared socket on failure
+            pperl_udp_transport:unprepare(LocalPort),
+            Err
+    end.
 
 %%===================================================================
 %% Testing
